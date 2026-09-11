@@ -1,6 +1,8 @@
+
 import os
 import re
 import html
+import time
 import xml.etree.ElementTree as ET
 from typing import Any, Dict, List
 
@@ -9,16 +11,19 @@ import streamlit as st
 from google import genai
 from google.genai import types
 
+
 APP_TITLE = "GeneProtein Intelligence"
 DEFAULT_MODEL = "gemini-2.5-flash"
 REQUEST_TIMEOUT = 20
 PUBMED_LIMIT = 8
+CLINVAR_LIMIT = 8
+PDB_LIMIT = 8
 
 UNIPROT_URL = "https://rest.uniprot.org/uniprotkb/search"
 EUTILS_BASE = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/"
+RCSB_SEARCH_URL = "https://search.rcsb.org/rcsbsearch/v2/query"
+RCSB_DATA_URL = "https://data.rcsb.org/rest/v1/core/entry"
 NCBI_TOOL = "GeneProteinIntelligence"
-# NCBI credentials are read through get_config_value() below.
-NCBI_EMAIL = os.getenv("NCBI_EMAIL", "")
 
 
 def clean_text(value: Any) -> str:
@@ -41,12 +46,19 @@ def get_ncbi_api_key() -> str:
     return get_config_value("NCBI_API_KEY", "")
 
 
+def get_ncbi_email() -> str:
+    return get_config_value("NCBI_EMAIL", "")
+
+
 def http_get(
     url: str,
     params: Dict[str, Any],
     retries: int = 2,
 ) -> requests.Response:
-    headers = {"User-Agent": f"{NCBI_TOOL}/1.0"}
+    headers = {
+        "User-Agent": f"{NCBI_TOOL}/2.0",
+        "Accept": "application/json, text/plain, */*",
+    }
 
     for attempt in range(retries + 1):
         try:
@@ -74,7 +86,59 @@ def http_get(
     raise RuntimeError("Request failed after retries.")
 
 
-def extract_uniprot_comments(record: Dict[str, Any], comment_type: str) -> List[str]:
+def http_post_json(
+    url: str,
+    payload: Dict[str, Any],
+    retries: int = 2,
+) -> requests.Response:
+    headers = {
+        "User-Agent": f"{NCBI_TOOL}/2.0",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+
+    for attempt in range(retries + 1):
+        try:
+            response = requests.post(
+                url,
+                json=payload,
+                headers=headers,
+                timeout=REQUEST_TIMEOUT,
+            )
+            if response.status_code == 429 and attempt < retries:
+                time.sleep(min(2 ** attempt, 8))
+                continue
+            response.raise_for_status()
+            return response
+        except requests.RequestException:
+            if attempt >= retries:
+                raise
+            time.sleep(2 ** attempt)
+
+    raise RuntimeError("Request failed after retries.")
+
+
+def first_ci(mapping: Dict[str, Any], *keys: str) -> Any:
+    """Case-insensitive lookup for NCBI/third-party JSON schema changes."""
+    lowered = {str(k).lower(): v for k, v in mapping.items()}
+    for key in keys:
+        if key.lower() in lowered:
+            return lowered[key.lower()]
+    return None
+
+
+def split_aliases(value: Any) -> List[str]:
+    if isinstance(value, list):
+        raw = [clean_text(x) for x in value]
+    else:
+        raw = re.split(r"[,;|]", clean_text(value))
+    return list(dict.fromkeys(x for x in raw if x))
+
+
+def extract_uniprot_comments(
+    record: Dict[str, Any],
+    comment_type: str,
+) -> List[str]:
     values = []
     for comment in record.get("comments", []):
         if comment.get("commentType") != comment_type:
@@ -83,7 +147,7 @@ def extract_uniprot_comments(record: Dict[str, Any], comment_type: str) -> List[
             text = clean_text(text_obj.get("value"))
             if text:
                 values.append(text)
-    return values
+    return list(dict.fromkeys(values))
 
 
 def extract_subcellular_locations(record: Dict[str, Any]) -> List[str]:
@@ -104,15 +168,9 @@ def search_uniprot(query: str) -> Dict[str, Any]:
         "query": f"({query}) AND (organism_id:9606)",
         "format": "json",
         "size": 1,
-        "fields": (
-            "accession,id,protein_name,gene_names,organism_name,length,"
-            "cc_function,cc_subcellular_location,cc_disease,cc_ptm,xref_geneid"
-        ),
     }
-
     response = http_get(UNIPROT_URL, params)
-    data = response.json()
-    results = data.get("results", [])
+    results = response.json().get("results", [])
     if not results:
         return {}
 
@@ -142,7 +200,6 @@ def search_uniprot(query: str) -> Dict[str, Any]:
         .get("fullName", {})
         .get("value")
     )
-
     if not protein_name:
         submitted = record.get("proteinDescription", {}).get("submittedName", [])
         if submitted:
@@ -155,24 +212,33 @@ def search_uniprot(query: str) -> Dict[str, Any]:
         if ref.get("database") == "GeneID":
             gene_ids.append(clean_text(ref.get("id")))
 
+    sequence = record.get("sequence", {})
     return {
         "accession": accession,
         "protein_name": protein_name,
         "gene_name": primary_gene,
         "gene_aliases": list(dict.fromkeys(gene_names)),
         "organism": organism,
-        "length": record.get("sequence", {}).get("length"),
+        "length": sequence.get("length"),
+        "mass": sequence.get("molWeight"),
         "function": extract_uniprot_comments(record, "FUNCTION"),
         "localization": extract_subcellular_locations(record),
         "disease": extract_uniprot_comments(record, "DISEASE"),
         "ptm": extract_uniprot_comments(record, "PTM"),
         "gene_ids": list(dict.fromkeys(gene_ids)),
-        "url": (
-            f"https://www.uniprot.org/uniprotkb/{accession}"
-            if accession
-            else ""
-        ),
+        "url": f"https://www.uniprot.org/uniprotkb/{accession}" if accession else "",
     }
+
+
+def ncbi_common_params() -> Dict[str, Any]:
+    params = {"tool": NCBI_TOOL}
+    email = get_ncbi_email()
+    api_key = get_ncbi_api_key()
+    if email:
+        params["email"] = email
+    if api_key:
+        params["api_key"] = api_key
+    return params
 
 
 def search_ncbi_gene(query: str) -> Dict[str, Any]:
@@ -180,25 +246,15 @@ def search_ncbi_gene(query: str) -> Dict[str, Any]:
         f'("{query}"[Gene Name] OR "{query}"[Gene Symbol] OR '
         f'"{query}"[All Fields]) AND 9606[Taxonomy ID]'
     )
-
     search_params = {
         "db": "gene",
         "term": term,
         "retmode": "json",
         "retmax": 3,
-        "tool": NCBI_TOOL,
+        **ncbi_common_params(),
     }
-    if NCBI_EMAIL:
-        search_params["email"] = NCBI_EMAIL
-    if get_ncbi_api_key():
-        search_params["api_key"] = get_ncbi_api_key()
-
-    search_response = http_get(
-        EUTILS_BASE + "esearch.fcgi",
-        search_params,
-    )
+    search_response = http_get(EUTILS_BASE + "esearch.fcgi", search_params)
     ids = search_response.json().get("esearchresult", {}).get("idlist", [])
-
     if not ids:
         return {}
 
@@ -206,69 +262,164 @@ def search_ncbi_gene(query: str) -> Dict[str, Any]:
         "db": "gene",
         "id": ",".join(ids),
         "retmode": "json",
-        "tool": NCBI_TOOL,
+        **ncbi_common_params(),
     }
-    if NCBI_EMAIL:
-        summary_params["email"] = NCBI_EMAIL
-    if get_ncbi_api_key():
-        summary_params["api_key"] = get_ncbi_api_key()
-
-    summary_response = http_get(
-        EUTILS_BASE + "esummary.fcgi",
-        summary_params,
-    )
+    summary_response = http_get(EUTILS_BASE + "esummary.fcgi", summary_params)
     result = summary_response.json().get("result", {})
     doc = result.get(ids[0], {})
+    if not isinstance(doc, dict):
+        return {}
+
+    # NCBI ESummary JSON has changed casing/schema across versions.
+    symbol = clean_text(first_ci(doc, "Name", "NomenclatureSymbol", "Symbol"))
+    description = clean_text(
+        first_ci(doc, "Summary", "Description", "DescriptionLong")
+    )
+    chromosome = clean_text(first_ci(doc, "Chromosome", "chromosome"))
+    map_location = clean_text(
+        first_ci(doc, "MapLocation", "maplocation", "Maplocation", "Map_Location")
+    )
 
     aliases = []
-    for key in ("OtherAliases", "NomenclatureSymbol"):
-        value = clean_text(doc.get(key))
+    for key in (
+        "OtherAliases",
+        "otheraliases",
+        "NomenclatureSymbol",
+        "nomenclaturesymbol",
+        "Synonym",
+        "Synonyms",
+    ):
+        value = first_ci(doc, key)
         if value:
-            aliases.extend(
-                [x.strip() for x in re.split(r"[,;]", value) if x.strip()]
-            )
+            aliases.extend(split_aliases(value))
+    aliases = [a for a in aliases if a != symbol]
 
-    gene_id = clean_text(doc.get("uid") or ids[0])
+    gene_id = clean_text(first_ci(doc, "uid", "Uid", "GeneID", "GeneId") or ids[0])
+
+    genomic_info = first_ci(doc, "GenomicInfo", "genomicinfo", "GenomicInfoType")
+    genomic_summary = ""
+    if isinstance(genomic_info, list):
+        genomic_summary = f"{len(genomic_info)} genomic placement record(s) returned."
+    elif genomic_info:
+        genomic_summary = clean_text(genomic_info)
 
     return {
         "gene_id": gene_id,
-        "symbol": clean_text(doc.get("Name")),
+        "symbol": symbol,
         "aliases": list(dict.fromkeys(aliases)),
-        "description": clean_text(doc.get("Summary")),
-        "chromosome": clean_text(doc.get("Chromosome")),
-        "map_location": clean_text(doc.get("MapLocation")),
+        "description": description,
+        "chromosome": chromosome,
+        "map_location": map_location,
+        "genomic_info": genomic_summary,
+        "raw_keys": list(doc.keys()),
         "url": f"https://www.ncbi.nlm.nih.gov/gene/{gene_id}",
     }
+
+
+def search_clinvar(query: str, limit: int = CLINVAR_LIMIT) -> List[Dict[str, str]]:
+    params = {
+        "db": "clinvar",
+        "term": f"{query}[gene] AND single_gene[prop]",
+        "retmode": "json",
+        "retmax": limit,
+        "sort": "relevance",
+        **ncbi_common_params(),
+    }
+    response = http_get(EUTILS_BASE + "esearch.fcgi", params)
+    ids = response.json().get("esearchresult", {}).get("idlist", [])
+    if not ids:
+        return []
+
+    summary_params = {
+        "db": "clinvar",
+        "id": ",".join(ids),
+        "retmode": "json",
+        **ncbi_common_params(),
+    }
+    response = http_get(EUTILS_BASE + "esummary.fcgi", summary_params)
+    result = response.json().get("result", {})
+
+    records = []
+    for uid in ids:
+        doc = result.get(uid, {})
+        if not isinstance(doc, dict):
+            continue
+        accession = clean_text(
+            first_ci(doc, "accessionversion", "accession", "rcv_accession", "rcvaccession")
+        )
+        title = clean_text(
+            first_ci(doc, "title", "name", "variation_name", "variationname")
+        )
+        significance = clean_text(
+            first_ci(
+                doc,
+                "clinical_significance",
+                "clinicalsignificance",
+                "clinical_significance_description",
+                "clinicalsignificancedescription",
+            )
+        )
+        variation_id = clean_text(
+            first_ci(doc, "variationid", "variation_id", "uid") or uid
+        )
+        records.append(
+            {
+                "uid": uid,
+                "accession": accession,
+                "title": title or f"ClinVar record {uid}",
+                "significance": significance,
+                "variation_id": variation_id,
+                "url": f"https://www.ncbi.nlm.nih.gov/clinvar/variation/{variation_id}/",
+            }
+        )
+    return records
+
+
+def search_pubmed(query: str, limit: int = PUBMED_LIMIT) -> List[Dict[str, str]]:
+    term = f'("{query}"[Title/Abstract]) AND humans[MeSH Terms]'
+    search_params = {
+        "db": "pubmed",
+        "term": term,
+        "retmode": "json",
+        "retmax": limit,
+        "sort": "relevance",
+        **ncbi_common_params(),
+    }
+    search_response = http_get(EUTILS_BASE + "esearch.fcgi", search_params)
+    ids = search_response.json().get("esearchresult", {}).get("idlist", [])
+    if not ids:
+        return []
+
+    fetch_params = {
+        "db": "pubmed",
+        "id": ",".join(ids),
+        "retmode": "xml",
+        "rettype": "abstract",
+        **ncbi_common_params(),
+    }
+    fetch_response = http_get(EUTILS_BASE + "efetch.fcgi", fetch_params)
+    return parse_pubmed_xml(fetch_response.text)
 
 
 def parse_pubmed_xml(xml_text: str) -> List[Dict[str, str]]:
     root = ET.fromstring(xml_text)
     papers = []
-
     for article in root.findall(".//PubmedArticle"):
         pmid = clean_text(article.findtext(".//PMID"))
-
         title_node = article.find(".//ArticleTitle")
-        title = (
-            clean_text("".join(title_node.itertext()))
-            if title_node is not None
-            else ""
-        )
+        title = clean_text("".join(title_node.itertext())) if title_node is not None else ""
 
         abstract_parts = []
         for node in article.findall(".//Abstract/AbstractText"):
             text = clean_text("".join(node.itertext()))
             label = clean_text(node.attrib.get("Label"))
-            abstract_parts.append(
-                f"{label}: {text}" if label else text
-            )
+            if text:
+                abstract_parts.append(f"{label}: {text}" if label else text)
 
         journal = clean_text(article.findtext(".//Journal/Title"))
         year = clean_text(article.findtext(".//PubDate/Year"))
         if not year:
-            year = clean_text(
-                article.findtext(".//PubDate/MedlineDate")
-            )[:4]
+            year = clean_text(article.findtext(".//PubDate/MedlineDate"))[:4]
 
         authors = []
         for author in article.findall(".//AuthorList/Author"):
@@ -281,81 +432,95 @@ def parse_pubmed_xml(xml_text: str) -> List[Dict[str, str]]:
             {
                 "pmid": pmid,
                 "title": title,
-                "abstract": " ".join(
-                    x for x in abstract_parts if x
-                ),
+                "abstract": " ".join(abstract_parts),
                 "journal": journal,
                 "year": year,
                 "authors": ", ".join(authors[:6]),
-                "url": (
-                    f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/"
-                    if pmid
-                    else ""
-                ),
+                "url": f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/" if pmid else "",
             }
         )
-
     return papers
 
 
-def search_pubmed(
-    query: str,
-    limit: int = PUBMED_LIMIT,
-) -> List[Dict[str, str]]:
-    term = f'("{query}"[Title/Abstract]) AND humans[MeSH Terms]'
+def search_pdb(query: str, uniprot_accession: str = "", limit: int = PDB_LIMIT) -> List[Dict[str, Any]]:
+    queries = []
+    if uniprot_accession:
+        queries.append(uniprot_accession)
+    queries.append(query)
 
-    search_params = {
-        "db": "pubmed",
-        "term": term,
-        "retmode": "json",
-        "retmax": limit,
-        "sort": "relevance",
-        "tool": NCBI_TOOL,
-    }
-    if NCBI_EMAIL:
-        search_params["email"] = NCBI_EMAIL
-    if get_ncbi_api_key():
-        search_params["api_key"] = get_ncbi_api_key()
+    ids = []
+    for text in queries:
+        payload = {
+            "query": {
+                "type": "terminal",
+                "service": "full_text",
+                "parameters": {"value": text},
+            },
+            "return_type": "entry",
+            "request_options": {
+                "pager": {"start": 0, "rows": limit},
+                "results_content_type": ["experimental", "computational"],
+            },
+        }
+        try:
+            response = http_post_json(RCSB_SEARCH_URL, payload)
+            for item in response.json().get("result_set", []):
+                identifier = clean_text(item.get("identifier"))
+                if identifier and identifier not in ids:
+                    ids.append(identifier)
+                if len(ids) >= limit:
+                    break
+        except requests.RequestException:
+            continue
+        if len(ids) >= limit:
+            break
 
-    search_response = http_get(
-        EUTILS_BASE + "esearch.fcgi",
-        search_params,
-    )
-    ids = search_response.json().get("esearchresult", {}).get("idlist", [])
+    structures = []
+    for pdb_id in ids[:limit]:
+        try:
+            response = http_get(f"{RCSB_DATA_URL}/{pdb_id}", {})
+            data = response.json()
+        except (requests.RequestException, ValueError):
+            continue
 
-    if not ids:
-        return []
+        entry = data.get("entry", {})
+        info = data.get("rcsb_entry_info", {})
+        struct = data.get("struct", {})
+        title = clean_text(struct.get("title"))
 
-    fetch_params = {
-        "db": "pubmed",
-        "id": ",".join(ids),
-        "retmode": "xml",
-        "rettype": "abstract",
-        "tool": NCBI_TOOL,
-    }
-    if NCBI_EMAIL:
-        fetch_params["email"] = NCBI_EMAIL
-    if get_ncbi_api_key():
-        fetch_params["api_key"] = get_ncbi_api_key()
+        methods = info.get("experimental_method", [])
+        if isinstance(methods, str):
+            methods = [methods]
+        resolution = info.get("resolution_combined") or []
+        if isinstance(resolution, (int, float)):
+            resolution = [resolution]
 
-    fetch_response = http_get(
-        EUTILS_BASE + "efetch.fcgi",
-        fetch_params,
-    )
-
-    return parse_pubmed_xml(fetch_response.text)
+        structures.append(
+            {
+                "pdb_id": pdb_id,
+                "title": title or f"PDB structure {pdb_id}",
+                "methods": [clean_text(x) for x in methods if clean_text(x)],
+                "resolution": resolution[0] if resolution else None,
+                "assembly_count": info.get("assembly_count"),
+                "deposition_date": clean_text(entry.get("rcsb_accession_info", {}).get("deposit_date")),
+                "url": f"https://www.rcsb.org/structure/{pdb_id}",
+            }
+        )
+    return structures
 
 
 def build_evidence(
     query: str,
     uniprot: Dict[str, Any],
     ncbi_gene: Dict[str, Any],
+    clinvar: List[Dict[str, str]],
+    pdb: List[Dict[str, Any]],
     papers: List[Dict[str, str]],
 ) -> str:
     lines = [
         f"SEARCH TERM: {query}",
         "",
-        "SOURCE 1 — UniProt",
+        "SOURCE — UniProt",
         f"URL: {uniprot.get('url', '')}",
         f"Accession: {uniprot.get('accession', '')}",
         f"Protein: {uniprot.get('protein_name', '')}",
@@ -363,13 +528,12 @@ def build_evidence(
         f"Aliases: {', '.join(uniprot.get('gene_aliases', []))}",
         f"Organism: {uniprot.get('organism', '')}",
         f"Length: {uniprot.get('length', '')} amino acids",
+        f"Molecular mass: {uniprot.get('mass', '')} Da",
         f"Function: {' | '.join(uniprot.get('function', []))}",
         f"Localization: {' | '.join(uniprot.get('localization', []))}",
         f"Disease annotations: {' | '.join(uniprot.get('disease', []))}",
-        f"PTM annotations: {' | '.join(uniprot.get('ptm', []))}",
-        f"Gene IDs: {', '.join(uniprot.get('gene_ids', []))}",
         "",
-        "SOURCE 2 — NCBI Gene",
+        "SOURCE — NCBI Gene",
         f"URL: {ncbi_gene.get('url', '')}",
         f"Gene ID: {ncbi_gene.get('gene_id', '')}",
         f"Symbol: {ncbi_gene.get('symbol', '')}",
@@ -377,10 +541,37 @@ def build_evidence(
         f"Description: {ncbi_gene.get('description', '')}",
         f"Chromosome: {ncbi_gene.get('chromosome', '')}",
         f"Map location: {ncbi_gene.get('map_location', '')}",
+        f"Genomic information: {ncbi_gene.get('genomic_info', '')}",
         "",
-        "SOURCE 3 — PubMed literature",
+        "SOURCE — ClinVar",
     ]
 
+    for item in clinvar:
+        lines.extend(
+            [
+                f"ClinVar accession: {item.get('accession', '')}",
+                f"Title: {item.get('title', '')}",
+                f"Clinical significance: {item.get('significance', '')}",
+                f"Variation ID: {item.get('variation_id', '')}",
+                f"URL: {item.get('url', '')}",
+                "",
+            ]
+        )
+
+    lines.append("SOURCE — RCSB Protein Data Bank")
+    for item in pdb:
+        lines.extend(
+            [
+                f"PDB ID: {item.get('pdb_id', '')}",
+                f"Title: {item.get('title', '')}",
+                f"Experimental method: {', '.join(item.get('methods', []))}",
+                f"Resolution: {item.get('resolution', '')}",
+                f"URL: {item.get('url', '')}",
+                "",
+            ]
+        )
+
+    lines.append("SOURCE — PubMed")
     for i, paper in enumerate(papers, start=1):
         lines.extend(
             [
@@ -394,57 +585,49 @@ def build_evidence(
                 "",
             ]
         )
-
     return "\n".join(lines)
 
 
-def generate_ai_report(
-    evidence: str,
-    model_name: str,
-) -> str:
+def generate_ai_report(evidence: str, model_name: str) -> str:
     api_key = get_config_value("GEMINI_API_KEY")
     if not api_key:
         raise RuntimeError(
-            "GEMINI_API_KEY is missing. Add it to Streamlit Secrets "
-            "or your local environment."
+            "GEMINI_API_KEY is missing. Add it to Streamlit Secrets."
         )
 
     client = genai.Client(api_key=api_key)
-
     system_instruction = """
 You are GeneProtein Intelligence (GPI), a biomedical research assistant.
 
-Use ONLY the retrieved source material supplied in the user message. Do not use
-unstated background knowledge to fill gaps. Never invent facts, numbers,
-variants, diseases, mechanisms, citations, or research findings.
+Use ONLY the retrieved source material supplied by the user. Never invent facts,
+numbers, variants, diseases, mechanisms, citations, or research findings.
 
-If a requested fact is not supported by the supplied evidence, write:
+If a requested fact is not supported, say:
 "Not available in the retrieved sources."
 
-Scientific rules:
+Rules:
 - Distinguish association from causation.
-- Do not make clinical diagnoses, treatment recommendations, or patient-specific advice.
+- Do not diagnose or recommend treatment.
 - Preserve uncertainty and conflicting evidence.
-- Do not imply that the retrieved PubMed set represents all literature.
-- Do not claim to have read papers whose abstracts/text were not supplied.
-- When discussing literature, identify the PMID when available.
-- Keep terminology scientifically accurate and readable for life-science students.
-- Use source labels such as [UniProt], [NCBI Gene], and [PubMed PMID: ...].
+- Do not imply the retrieved PubMed set is exhaustive.
+- Do not claim to have read full papers when only abstracts were retrieved.
+- Identify PMIDs when discussing literature.
+- Clearly label evidence by source: [UniProt], [NCBI Gene], [ClinVar],
+  [RCSB PDB], [PubMed PMID: ...].
+- For ClinVar, report the database's classification as source evidence; do not
+  convert it into patient-specific clinical advice.
+- For PDB, distinguish experimental structures from computed structure models.
 
-Return these sections:
-1. Gene / Protein Overview
-2. Protein Function
-3. Subcellular Localization
-4. Gene Information
-5. Disease Associations
-6. Mutations / Variants
-7. Literature Findings
-8. Research Intelligence
-9. Evidence Limitations
-10. Source References
-
-In "Research Intelligence", only report patterns or insights that can reasonably
-be supported by the retrieved evidence. Do not speculate beyond it.
+Return:
+1. Executive Overview
+2. Gene & Genomic Context
+3. Protein Function & Localization
+4. Disease & Variant Evidence
+5. 3D Structural Evidence
+6. Literature Findings
+7. Research Intelligence
+8. Evidence Limitations
+9. Sources
 """.strip()
 
     response = client.models.generate_content(
@@ -453,237 +636,265 @@ be supported by the retrieved evidence. Do not speculate beyond it.
         config=types.GenerateContentConfig(
             system_instruction=system_instruction,
             temperature=0.2,
-            max_output_tokens=3000,
+            max_output_tokens=3500,
         ),
     )
-
     text = getattr(response, "text", None)
     if not text:
         raise RuntimeError("Gemini returned no text.")
-
     return text
 
 
-def render_sources(
-    uniprot: Dict[str, Any],
-    ncbi_gene: Dict[str, Any],
-    papers: List[Dict[str, str]],
-) -> None:
-    st.subheader("Sources")
+def source_link(label: str, url: str, text: str) -> str:
+    return f"- **{label}:** [{html.escape(text)}]({url})"
 
+
+def render_sources(uniprot, ncbi_gene, clinvar, pdb, papers) -> None:
+    st.subheader("Evidence Sources")
     if uniprot.get("url"):
-        st.markdown(
-            f"- **UniProt:** "
-            f"[{uniprot.get('accession', 'record')}]({uniprot['url']})"
-        )
-
+        st.markdown(source_link("UniProt", uniprot["url"], uniprot.get("accession", "record")))
     if ncbi_gene.get("url"):
-        st.markdown(
-            f"- **NCBI Gene:** "
-            f"[Gene {ncbi_gene.get('gene_id', '')}]({ncbi_gene['url']})"
-        )
-
+        st.markdown(source_link("NCBI Gene", ncbi_gene["url"], f"Gene {ncbi_gene.get('gene_id', '')}"))
+    for item in clinvar:
+        if item.get("url"):
+            st.markdown(source_link("ClinVar", item["url"], item.get("accession") or item.get("title", "record")))
+    for item in pdb:
+        if item.get("url"):
+            st.markdown(source_link("RCSB PDB", item["url"], item.get("pdb_id", "structure")))
     for paper in papers:
         if paper.get("url"):
-            title = html.escape(
-                paper.get("title", "PubMed article")
-            )
-            st.markdown(
-                f"- **PubMed:** [{title}]({paper['url']})"
-            )
+            st.markdown(source_link("PubMed", paper["url"], f"PMID {paper.get('pmid', '')}"))
 
 
-def render_uniprot(uniprot: Dict[str, Any]) -> None:
-    st.subheader("Protein Information")
-
-    col1, col2 = st.columns(2)
-
-    with col1:
-        st.metric(
-            "UniProt accession",
-            uniprot.get("accession") or "Unavailable",
-        )
-        st.write(
-            f"**Protein:** "
-            f"{uniprot.get('protein_name') or 'Unavailable'}"
-        )
-        st.write(
-            f"**Gene:** "
-            f"{uniprot.get('gene_name') or 'Unavailable'}"
-        )
-        st.write(
-            f"**Organism:** "
-            f"{uniprot.get('organism') or 'Unavailable'}"
-        )
-
-    with col2:
-        length = uniprot.get("length")
-        st.metric(
-            "Protein length",
-            f"{length} aa" if length else "Unavailable",
-        )
-        st.write(
-            f"**Gene aliases:** "
-            f"{', '.join(uniprot.get('gene_aliases', [])) or 'Unavailable'}"
-        )
-
-    st.markdown("**Function**")
-    st.write(
-        "\n\n".join(uniprot.get("function", []))
-        or "Unavailable in the retrieved UniProt record."
-    )
-
-    st.markdown("**Subcellular localization**")
-    st.write(
-        ", ".join(uniprot.get("localization", []))
-        or "Unavailable in the retrieved UniProt record."
-    )
-
-    if uniprot.get("disease"):
-        st.markdown("**UniProt disease annotations**")
-        for item in uniprot["disease"]:
-            st.write(f"- {item}")
-
-
-def render_gene(
-    ncbi_gene: Dict[str, Any],
-    uniprot: Dict[str, Any],
-) -> None:
-    st.subheader("Gene Information")
-
+def render_gene(ncbi_gene: Dict[str, Any], uniprot: Dict[str, Any]) -> None:
+    st.subheader("Gene & Genomic Context")
     if not ncbi_gene:
-        st.info("No NCBI Gene record was found for this search.")
+        st.info("No NCBI Gene record was found.")
         return
 
-    st.write(
-        f"**Gene ID:** "
-        f"{ncbi_gene.get('gene_id') or 'Unavailable'}"
-    )
-    st.write(
-        f"**Symbol:** "
-        f"{ncbi_gene.get('symbol') or uniprot.get('gene_name') or 'Unavailable'}"
-    )
-    st.write(
-        f"**Aliases:** "
-        f"{', '.join(ncbi_gene.get('aliases', [])) or 'Unavailable'}"
-    )
-    st.write(
-        f"**Chromosome:** "
-        f"{ncbi_gene.get('chromosome') or 'Unavailable'}"
-    )
-    st.write(
-        f"**Map location:** "
-        f"{ncbi_gene.get('map_location') or 'Unavailable'}"
-    )
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Gene ID", ncbi_gene.get("gene_id") or "—")
+    c2.metric("Chromosome", ncbi_gene.get("chromosome") or "—")
+    c3.metric("Map location", ncbi_gene.get("map_location") or "—")
+    c4.metric("Symbol", ncbi_gene.get("symbol") or uniprot.get("gene_name") or "—")
 
-    st.markdown("**NCBI description**")
-    st.write(
-        ncbi_gene.get("description")
-        or "Unavailable in the retrieved NCBI Gene record."
-    )
+    st.markdown("**Aliases**")
+    st.write(", ".join(ncbi_gene.get("aliases", [])) or "Not available in the retrieved NCBI record.")
+
+    st.markdown("**Gene description**")
+    st.write(ncbi_gene.get("description") or "Not available in the retrieved NCBI record.")
+
+    st.markdown("**Genomic information**")
+    st.write(ncbi_gene.get("genomic_info") or "No additional genomic placement summary was returned.")
 
 
-def render_literature(
-    papers: List[Dict[str, str]],
-) -> None:
-    st.subheader("Scientific Literature")
+def render_protein(uniprot: Dict[str, Any]) -> None:
+    st.subheader("Protein Intelligence")
+    if not uniprot:
+        st.info("No human UniProt record was found.")
+        return
 
-    if not papers:
-        st.info(
-            "No relevant PubMed results were returned for this search."
-        )
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("UniProt", uniprot.get("accession") or "—")
+    c2.metric("Length", f"{uniprot.get('length')} aa" if uniprot.get("length") else "—")
+    c3.metric("Mass", f"{uniprot.get('mass'):,} Da" if isinstance(uniprot.get("mass"), int) else "—")
+    c4.metric("Gene", uniprot.get("gene_name") or "—")
+
+    st.markdown("**Protein name**")
+    st.write(uniprot.get("protein_name") or "Not available.")
+
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown("**Function**")
+        st.write("\n\n".join(uniprot.get("function", [])) or "Not available in the retrieved UniProt record.")
+    with c2:
+        st.markdown("**Subcellular localization**")
+        st.write(", ".join(uniprot.get("localization", [])) or "Not available in the retrieved UniProt record.")
+
+    if uniprot.get("gene_aliases"):
+        st.markdown("**Gene names / aliases from UniProt**")
+        st.write(", ".join(uniprot["gene_aliases"]))
+
+
+def render_diseases(clinvar, uniprot) -> None:
+    st.subheader("Disease & Variant Evidence")
+
+    if uniprot.get("disease"):
+        st.markdown("### UniProt disease annotations")
+        for item in uniprot["disease"]:
+            st.write(f"- {item}")
+    else:
+        st.info("No UniProt disease annotation was retrieved for this record.")
+
+    st.markdown("### ClinVar evidence")
+    if not clinvar:
+        st.write("No ClinVar records were retrieved for this gene search.")
         return
 
     st.caption(
-        f"Showing {len(papers)} relevant PubMed records retrieved for this "
-        "search. This is not an exhaustive literature review."
+        f"{len(clinvar)} ClinVar records retrieved. These are database records and "
+        "should not be interpreted as patient-specific medical advice."
     )
-
-    for paper in papers:
-        title = paper.get("title") or "Untitled article"
-
+    for item in clinvar:
+        title = item.get("title") or "ClinVar record"
         with st.expander(title):
-            st.write(
-                f"**Journal:** {paper.get('journal') or 'Unavailable'}  \n"
-                f"**Year:** {paper.get('year') or 'Unavailable'}  \n"
-                f"**PMID:** {paper.get('pmid') or 'Unavailable'}"
-            )
+            st.write(f"**Accession:** {item.get('accession') or '—'}")
+            st.write(f"**Clinical significance:** {item.get('significance') or 'Not reported in the retrieved summary.'}")
+            st.write(f"**Variation ID:** {item.get('variation_id') or '—'}")
+            if item.get("url"):
+                st.markdown(f"[Open ClinVar record]({item['url']})")
 
+
+def render_pdb(pdb) -> None:
+    st.subheader("3D Structural Evidence")
+    if not pdb:
+        st.info("No RCSB Protein Data Bank structures were retrieved for this search.")
+        st.caption("A missing PDB result does not mean that the protein has no known structure; it means no matching structures were returned by the current search.")
+        return
+
+    st.metric("Matching structures", len(pdb))
+    for item in pdb:
+        title = item.get("title") or item.get("pdb_id")
+        with st.expander(f"{item.get('pdb_id')} — {title}"):
+            st.write(f"**Experimental method:** {', '.join(item.get('methods', [])) or 'Not reported'}")
+            resolution = item.get("resolution")
+            st.write(f"**Resolution:** {resolution} Å" if resolution else "**Resolution:** Not reported")
+            if item.get("deposition_date"):
+                st.write(f"**Deposit date:** {item['deposition_date']}")
+            st.markdown(f"[View structure on RCSB PDB]({item['url']})")
+
+
+def render_literature(papers) -> None:
+    st.subheader("Scientific Literature")
+    if not papers:
+        st.info("No relevant PubMed results were returned.")
+        return
+    st.caption(f"Showing {len(papers)} relevant PubMed records; this is not an exhaustive literature review.")
+    for paper in papers:
+        with st.expander(paper.get("title") or "Untitled article"):
+            st.write(
+                f"**Journal:** {paper.get('journal') or '—'}  \n"
+                f"**Year:** {paper.get('year') or '—'}  \n"
+                f"**PMID:** {paper.get('pmid') or '—'}"
+            )
             if paper.get("authors"):
                 st.write(f"**Authors:** {paper['authors']}")
-
-            st.write(
-                paper.get("abstract")
-                or "Abstract unavailable."
-            )
-
+            st.write(paper.get("abstract") or "Abstract unavailable.")
             if paper.get("url"):
-                st.markdown(
-                    f"[Open PubMed record]({paper['url']})"
-                )
+                st.markdown(f"[Open PubMed record]({paper['url']})")
 
 
 def run_analysis(query: str) -> None:
-    with st.spinner(
-        "Retrieving UniProt, NCBI Gene and PubMed evidence..."
-    ):
+    sources = {}
+    failures = []
+
+    with st.status("Building your evidence profile…", expanded=True) as status:
+        steps = [
+            ("UniProt", lambda: search_uniprot(query)),
+            ("NCBI Gene", lambda: search_ncbi_gene(query)),
+        ]
+
+        for label, func in steps:
+            st.write(f"Retrieving {label}…")
+            try:
+                sources["uniprot" if label == "UniProt" else "ncbi_gene"] = func()
+            except Exception as exc:
+                sources["uniprot" if label == "UniProt" else "ncbi_gene"] = {}
+                failures.append(f"{label}: {exc}")
+
+        gene_symbol = sources.get("ncbi_gene", {}).get("symbol") or query
+        st.write("Retrieving ClinVar…")
         try:
-            uniprot = search_uniprot(query)
-            ncbi_gene = search_ncbi_gene(query)
-            papers = search_pubmed(query)
-
-        except requests.RequestException as exc:
-            st.error(f"A data-source request failed: {exc}")
-            return
-
-        except (ValueError, ET.ParseError) as exc:
-            st.error(
-                f"A data-source response could not be parsed: {exc}"
-            )
-            return
-
+            sources["clinvar"] = search_clinvar(gene_symbol)
         except Exception as exc:
-            st.error(f"Unexpected data retrieval error: {exc}")
-            return
+            sources["clinvar"] = []
+            failures.append(f"ClinVar: {exc}")
 
-    if not uniprot and not ncbi_gene and not papers:
-        st.warning(
-            "No human UniProt, NCBI Gene, or PubMed results were found. "
-            "Try a gene/protein such as TP53, BRCA1, or EGFR."
-        )
+        st.write("Searching RCSB Protein Data Bank…")
+        try:
+            sources["pdb"] = search_pdb(
+                gene_symbol,
+                sources.get("uniprot", {}).get("accession", ""),
+            )
+        except Exception as exc:
+            sources["pdb"] = []
+            failures.append(f"RCSB PDB: {exc}")
+
+        st.write("Retrieving PubMed literature…")
+        try:
+            sources["papers"] = search_pubmed(gene_symbol)
+        except Exception as exc:
+            sources["papers"] = []
+            failures.append(f"PubMed: {exc}")
+
+        status.update(label="Evidence retrieval complete", state="complete")
+
+    if failures:
+        with st.expander("Some sources were unavailable", expanded=False):
+            for failure in failures:
+                st.write(f"- {failure}")
+
+    if not any(sources.get(k) for k in ("uniprot", "ncbi_gene", "clinvar", "pdb", "papers")):
+        st.error("No usable evidence was retrieved. Try a human gene such as TP53, BRCA1, or EGFR.")
         return
 
     st.session_state["analysis"] = {
         "query": query,
-        "uniprot": uniprot,
-        "ncbi_gene": ncbi_gene,
-        "papers": papers,
+        **sources,
+        "failures": failures,
     }
 
-    model_name = get_config_value(
-        "GEMINI_MODEL",
-        DEFAULT_MODEL,
+    model_name = get_config_value("GEMINI_MODEL", DEFAULT_MODEL)
+    evidence = build_evidence(
+        query,
+        sources.get("uniprot", {}),
+        sources.get("ncbi_gene", {}),
+        sources.get("clinvar", []),
+        sources.get("pdb", []),
+        sources.get("papers", []),
     )
 
-    with st.spinner(
-        f"Gemini is synthesizing the retrieved evidence using {model_name}..."
-    ):
+    with st.spinner(f"Gemini is synthesizing the evidence using {model_name}…"):
         try:
-            evidence = build_evidence(
-                query,
-                uniprot,
-                ncbi_gene,
-                papers,
-            )
-            report = generate_ai_report(
-                evidence,
-                model_name,
-            )
-            st.session_state["report"] = report
-
+            st.session_state["report"] = generate_ai_report(evidence, model_name)
+            st.session_state["ai_error"] = ""
         except Exception as exc:
             st.session_state["report"] = ""
-            st.error(f"AI synthesis failed: {exc}")
+            st.session_state["ai_error"] = str(exc)
+
+
+def apply_styles() -> None:
+    st.markdown(
+        """
+        <style>
+        .block-container {padding-top: 2rem; padding-bottom: 3rem; max-width: 1450px;}
+        .gpi-hero {
+            padding: 2.1rem 2.2rem;
+            border: 1px solid rgba(120,140,180,.25);
+            border-radius: 24px;
+            background: linear-gradient(135deg, rgba(35,55,90,.12), rgba(70,120,150,.06));
+            margin-bottom: 1.2rem;
+        }
+        .gpi-kicker {font-size:.82rem; letter-spacing:.12em; text-transform:uppercase; opacity:.7; font-weight:700;}
+        .gpi-title {font-size:2.6rem; line-height:1.05; font-weight:800; margin:.25rem 0 .6rem;}
+        .gpi-subtitle {font-size:1.05rem; opacity:.78; max-width:850px;}
+        .source-chip {
+            display:inline-block; padding:.3rem .65rem; border-radius:999px;
+            border:1px solid rgba(120,140,180,.28); margin:.15rem .25rem .15rem 0;
+            font-size:.78rem;
+        }
+        .section-card {
+            padding:1.05rem 1.15rem; border:1px solid rgba(120,140,180,.2);
+            border-radius:18px; background:rgba(128,128,128,.045); height:100%;
+        }
+        div[data-testid="stMetric"] {
+            border:1px solid rgba(120,140,180,.2); padding:.75rem; border-radius:16px;
+            background:rgba(128,128,128,.035);
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 def main() -> None:
@@ -693,168 +904,149 @@ def main() -> None:
         layout="wide",
         initial_sidebar_state="expanded",
     )
+    apply_styles()
 
-    st.title("🧬 GeneProtein Intelligence")
-    st.caption(
-        "AI-powered biomedical research assistant for gene and protein exploration."
+    st.markdown(
+        """
+        <div class="gpi-hero">
+          <div class="gpi-kicker">Biomedical AI Research Workspace</div>
+          <div class="gpi-title">🧬 GeneProtein Intelligence</div>
+          <div class="gpi-subtitle">
+            Evidence-grounded exploration of human genes, proteins, disease evidence,
+            3D structures and scientific literature.
+          </div>
+          <div style="margin-top:.8rem;">
+            <span class="source-chip">UniProt</span>
+            <span class="source-chip">NCBI Gene</span>
+            <span class="source-chip">ClinVar</span>
+            <span class="source-chip">RCSB PDB</span>
+            <span class="source-chip">PubMed</span>
+            <span class="source-chip">Gemini AI</span>
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
     )
 
     with st.sidebar:
-        st.header("About GPI")
-        st.write(
-            "GPI retrieves human gene/protein evidence from UniProt, NCBI Gene, "
-            "and PubMed, then uses Gemini Flash to organize the retrieved evidence "
-            "into a research-oriented profile."
-        )
-        st.warning(
-            "Educational/research tool only. Not a diagnostic or treatment system."
-        )
+        st.markdown("### GPI")
+        st.write("Research-oriented gene & protein intelligence.")
         st.divider()
-        st.write("**Suggested tests:** TP53 · BRCA1 · EGFR")
-
-    st.markdown(
-        "Enter a **human gene or protein name**. GPI will retrieve source evidence "
-        "and generate a grounded research summary."
-    )
+        st.markdown("**Try:** `TP53` · `BRCA1` · `EGFR`")
+        st.caption("Educational/research tool. Not a diagnostic or treatment system.")
+        if st.button("Clear current analysis", use_container_width=True):
+            for key in ("analysis", "report", "ai_error"):
+                st.session_state.pop(key, None)
+            st.rerun()
 
     query = st.text_input(
-        "Gene / protein",
-        placeholder="e.g. TP53, BRCA1, EGFR",
+        "Search a human gene or protein",
+        placeholder="e.g. BRCA1, TP53, EGFR",
         max_chars=100,
-    ).strip()
+        label_visibility="collapsed",
+    )
 
-    if st.button(
-        "🔎 Analyze",
-        type="primary",
-        use_container_width=True,
-    ):
-        if not query:
-            st.error("Please enter a gene or protein name.")
-        elif len(query) < 2:
+    if st.button("🔎  Analyze gene / protein", type="primary", use_container_width=True):
+        if not query.strip():
+            st.error("Enter a gene or protein name first.")
+        elif len(query.strip()) < 2:
             st.error("Please enter at least 2 characters.")
         else:
-            run_analysis(query)
+            run_analysis(query.strip())
 
     analysis = st.session_state.get("analysis")
-
     if not analysis:
-        st.info(
-            "Enter a gene/protein above and click Analyze."
+        st.markdown(
+            """
+            <div class="section-card">
+            <b>Start a research profile</b><br>
+            Search a human gene or protein to retrieve structured evidence from
+            multiple biomedical databases and generate an AI-grounded synthesis.
+            </div>
+            """,
+            unsafe_allow_html=True,
         )
         return
 
-    uniprot = analysis["uniprot"]
-    ncbi_gene = analysis["ncbi_gene"]
-    papers = analysis["papers"]
+    uniprot = analysis.get("uniprot", {})
+    ncbi_gene = analysis.get("ncbi_gene", {})
+    clinvar = analysis.get("clinvar", [])
+    pdb = analysis.get("pdb", [])
+    papers = analysis.get("papers", [])
 
-    st.divider()
-    st.header(
-        f"Research Profile: {analysis['query']}"
-    )
+    symbol = ncbi_gene.get("symbol") or uniprot.get("gene_name") or analysis["query"]
+    protein = uniprot.get("protein_name") or "Protein record unavailable"
+
+    st.markdown(f"## {symbol}")
+    st.caption(protein)
+
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Gene ID", ncbi_gene.get("gene_id") or "—")
+    c2.metric("UniProt", uniprot.get("accession") or "—")
+    c3.metric("ClinVar", len(clinvar))
+    c4.metric("PDB structures", len(pdb))
+    c5.metric("PubMed", len(papers))
 
     tabs = st.tabs(
-        [
-            "Overview",
-            "Protein",
-            "Gene",
-            "Diseases",
-            "Literature",
-            "AI Research Intelligence",
-            "Sources",
-        ]
+        ["Overview", "Gene", "Protein", "Diseases & Variants", "3D Structure", "Literature", "AI Research", "Sources"]
     )
 
     with tabs[0]:
-        st.subheader("Gene / Protein Overview")
+        c1, c2 = st.columns(2)
+        with c1:
+            st.markdown('<div class="section-card"><b>Gene context</b><br><br>'
+                        f"Chromosome: <b>{ncbi_gene.get('chromosome') or '—'}</b><br>"
+                        f"Map location: <b>{ncbi_gene.get('map_location') or '—'}</b><br>"
+                        f"Aliases: {', '.join(ncbi_gene.get('aliases', [])) or '—'}"
+                        "</div>", unsafe_allow_html=True)
+        with c2:
+            st.markdown('<div class="section-card"><b>Protein snapshot</b><br><br>'
+                        f"Name: <b>{html.escape(protein)}</b><br>"
+                        f"Length: <b>{uniprot.get('length') or '—'} aa</b><br>"
+                        f"Localization: {', '.join(uniprot.get('localization', [])) or '—'}"
+                        "</div>", unsafe_allow_html=True)
+
+        st.markdown("### What the retrieved evidence says")
         st.write(
-            f"**Search term:** {analysis['query']}"
-        )
-        st.write(
-            f"**Protein:** "
-            f"{uniprot.get('protein_name') or 'Unavailable'}"
-        )
-        st.write(
-            f"**Gene:** "
-            f"{uniprot.get('gene_name') or ncbi_gene.get('symbol') or 'Unavailable'}"
-        )
-        st.write(
-            f"**Organism:** "
-            f"{uniprot.get('organism') or 'Human result not available'}"
-        )
-        st.write(
-            uniprot.get(
-                "function",
-                ["No UniProt function annotation retrieved."],
-            )[0]
+            uniprot.get("function", ["No UniProt function annotation was retrieved."])[0]
         )
 
     with tabs[1]:
-        render_uniprot(uniprot)
-
-    with tabs[2]:
         render_gene(ncbi_gene, uniprot)
 
+    with tabs[2]:
+        render_protein(uniprot)
+
     with tabs[3]:
-        st.subheader("Disease Associations")
-
-        disease_items = uniprot.get("disease", [])
-
-        if disease_items:
-            st.info(
-                "These are annotations retrieved from UniProt. They are presented "
-                "as source information, not as individual medical advice or proof "
-                "of causation."
-            )
-            for item in disease_items:
-                st.write(f"- {item}")
-        else:
-            st.write(
-                "No UniProt disease annotations were retrieved for this record."
-            )
-
-        st.write(
-            "Clinical variant interpretation is intentionally limited in the MVP. "
-            "Future versions can integrate ClinVar/Open Targets with explicit source handling."
-        )
+        render_diseases(clinvar, uniprot)
 
     with tabs[4]:
-        render_literature(papers)
+        render_pdb(pdb)
 
     with tabs[5]:
-        st.subheader("AI Research Intelligence")
-        report = st.session_state.get("report", "")
-
-        if report:
-            st.markdown(report)
-        else:
-            st.info(
-                "No AI report is available. Check the Gemini API key "
-                "and error message above."
-            )
+        render_literature(papers)
 
     with tabs[6]:
-        render_sources(
-            uniprot,
-            ncbi_gene,
-            papers,
-        )
+        st.subheader("AI Research Intelligence")
+        ai_error = st.session_state.get("ai_error", "")
+        report = st.session_state.get("report", "")
+        if ai_error:
+            st.warning(f"AI synthesis is unavailable right now: {ai_error}")
+            st.info("The retrieved database evidence is still available in the other tabs.")
+        elif report:
+            st.markdown(report)
+        else:
+            st.info("No AI synthesis is available.")
+
+    with tabs[7]:
+        render_sources(uniprot, ncbi_gene, clinvar, pdb, papers)
 
     st.divider()
     st.caption(
-        "GPI is an educational/research prototype. AI synthesis is based only "
-        "on the retrieved source set shown in this application. Always verify "
-        "important findings against the original records and publications."
+        "GPI v2 is an educational/research prototype. Database records and AI synthesis "
+        "should be verified against the original sources for important scientific work."
     )
 
 
 if __name__ == "__main__":
     main()
-
-
-
-
-
-       
-           
-        
-    
