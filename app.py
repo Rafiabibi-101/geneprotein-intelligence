@@ -726,50 +726,90 @@ def run(query: str):
             st.session_state["ai_error"] = str(e)
 
 
+
 def styles():
     st.markdown("""
     <style>
-    .block-container {max-width:1450px;padding-top:2rem;padding-bottom:3rem}
-    .hero {padding:2rem 2.2rem;border-radius:26px;border:1px solid rgba(100,120,160,.25);
-           background:linear-gradient(135deg,rgba(55,80,125,.14),rgba(70,150,150,.06));margin-bottom:1rem}
-    .kicker {font-size:.78rem;letter-spacing:.14em;text-transform:uppercase;font-weight:800;opacity:.65}
-    .title {font-size:2.65rem;font-weight:850;line-height:1.05;margin:.3rem 0 .55rem}
-    .sub {font-size:1.02rem;opacity:.76;max-width:900px}
-    .card {padding:1rem 1.1rem;border:1px solid rgba(100,120,160,.2);border-radius:18px;background:rgba(128,128,128,.04);height:100%}
-    div[data-testid="stMetric"] {border:1px solid rgba(100,120,160,.2);padding:.7rem;border-radius:15px;background:rgba(128,128,128,.035)}
+    :root {
+      --gpi-border: rgba(120,140,180,.20);
+      --gpi-soft: rgba(120,140,180,.07);
+      --gpi-muted: rgba(120,120,130,.72);
+    }
+    .block-container {max-width:1500px;padding:1.2rem 2.2rem 3rem}
+    header[data-testid="stHeader"] {background:transparent}
+    .gpi-hero {
+      position:relative; overflow:hidden; padding:2.2rem 2.3rem;
+      border:1px solid var(--gpi-border); border-radius:30px;
+      background:
+        radial-gradient(circle at 88% 15%, rgba(80,170,190,.18), transparent 28%),
+        radial-gradient(circle at 15% 110%, rgba(90,110,190,.13), transparent 35%),
+        linear-gradient(135deg, rgba(30,45,75,.10), rgba(70,150,160,.06));
+      margin-bottom:1.1rem;
+    }
+    .gpi-kicker {font-size:.72rem;letter-spacing:.16em;text-transform:uppercase;font-weight:800;opacity:.62}
+    .gpi-title {font-size:clamp(2.25rem,5vw,4.2rem);font-weight:900;letter-spacing:-.045em;line-height:.98;margin:.45rem 0 .8rem}
+    .gpi-sub {font-size:1.03rem;line-height:1.6;opacity:.76;max-width:880px}
+    .gpi-pill {
+      display:inline-block;padding:.32rem .65rem;border-radius:999px;
+      background:rgba(70,150,160,.10);border:1px solid rgba(70,150,160,.18);
+      font-size:.76rem;font-weight:700;margin:.8rem .35rem 0 0
+    }
+    .gpi-search {
+      padding:1.15rem;border:1px solid var(--gpi-border);border-radius:22px;
+      background:var(--gpi-soft);margin-bottom:1.2rem
+    }
+    .gpi-card {
+      padding:1.15rem 1.2rem;border:1px solid var(--gpi-border);
+      border-radius:20px;background:rgba(128,128,128,.035);height:100%
+    }
+    .gpi-card-title {font-size:.76rem;text-transform:uppercase;letter-spacing:.10em;font-weight:800;opacity:.62}
+    .gpi-big {font-size:1.45rem;font-weight:850;margin-top:.35rem}
+    .gpi-small {font-size:.82rem;opacity:.66}
+    .gpi-section {
+      padding:1rem 1.1rem;border-left:3px solid rgba(80,160,170,.55);
+      background:var(--gpi-soft);border-radius:0 15px 15px 0;margin:1rem 0
+    }
+    div[data-testid="stMetric"] {border:1px solid var(--gpi-border);padding:.8rem;border-radius:16px;background:var(--gpi-soft)}
+    div[data-testid="stMetricLabel"] {font-size:.74rem}
+    button[kind="primary"] {border-radius:14px;font-weight:800}
+    .stTabs [data-baseweb="tab-list"] {gap:5px}
+    .stTabs [data-baseweb="tab"] {border-radius:12px;padding:.55rem .8rem}
+    .gpi-footer {text-align:center;opacity:.55;font-size:.78rem;padding-top:1rem}
     </style>
     """, unsafe_allow_html=True)
 
 
 def render_gene(g: Dict[str, Any]):
-    st.subheader("Gene & genomic context")
+    st.markdown("### Genomic identity")
     if not g:
-        st.info("No confident NCBI Gene record.")
+        st.info("No confident NCBI Gene record was retrieved.")
         return
     c = st.columns(4)
-    c[0].metric("Gene ID", g.get("gene_id") or "—")
+    c[0].metric("NCBI Gene ID", g.get("gene_id") or "—")
     c[1].metric("Chromosome", g.get("chromosome") or "—")
     c[2].metric("Map location", g.get("map_location") or "—")
-    c[3].metric("Symbol", g.get("symbol") or "—")
+    c[3].metric("Official symbol", g.get("symbol") or "—")
+    st.markdown('<div class="gpi-section"><b>Description</b><br>' +
+                html.escape(g.get("description") or "Not available.") + '</div>',
+                unsafe_allow_html=True)
     st.markdown("**Aliases**")
     st.write(", ".join(g.get("aliases", [])) or "Not available.")
-    st.markdown("**Description**")
-    st.write(g.get("description") or "Not available.")
     if g.get("url"):
-        st.markdown(f"[Open NCBI Gene record]({g['url']})")
+        st.link_button("Open NCBI Gene record ↗", g["url"])
 
 
 def render_protein(u: Dict[str, Any]):
-    st.subheader("Protein intelligence")
+    st.markdown("### Protein identity")
     if not u:
-        st.info("No confident human UniProt record.")
+        st.info("No confident human UniProt record was retrieved.")
         return
     c = st.columns(4)
     c[0].metric("UniProt", u.get("accession") or "—")
     c[1].metric("Length", f"{u.get('length')} aa" if u.get("length") else "—")
-    c[2].metric("Reviewed", "Yes" if u.get("reviewed") else "No")
-    c[3].metric("PDB links", len(u.get("pdb_ids", [])))
-    st.markdown(f"**Protein:** {u.get('protein_name') or '—'}")
+    c[2].metric("Reviewed", "Swiss-Prot" if u.get("reviewed") else "—")
+    c[3].metric("Structures", len(u.get("pdb_ids", [])))
+    st.markdown(f'<div class="gpi-section"><b>Protein</b><br>{html.escape(u.get("protein_name") or "—")}</div>',
+                unsafe_allow_html=True)
     x, y = st.columns(2)
     with x:
         st.markdown("**Function**")
@@ -780,106 +820,146 @@ def render_protein(u: Dict[str, Any]):
     st.markdown("**Gene names / aliases**")
     st.write(", ".join(u.get("gene_aliases", [])) or "Not available.")
     if u.get("url"):
-        st.markdown(f"[Open UniProt record]({u['url']})")
+        st.link_button(f"Open UniProt {u.get('accession')} ↗", u["url"])
 
 
 def render_clinvar(items):
-    st.subheader("Disease & variant evidence")
+    st.markdown("### Clinical variant evidence")
     if not items:
         st.info("No ClinVar records were returned for the resolved gene.")
         return
-    st.caption("ClinVar is an evidence archive. Its classifications are not patient-specific diagnoses.")
+    st.caption("ClinVar is an archive of submitted evidence and interpretations; it is not a patient-specific diagnosis.")
     for x in items:
-        with st.expander(f"{x.get('accession') or 'ClinVar record'} — {x.get('title')}"):
-            st.write(f"**Database classification:** {x.get('significance') or 'Not stated in retrieved summary.'}")
+        title = x.get("title") or "ClinVar record"
+        with st.expander(f"{x.get('accession') or 'ClinVar'}  ·  {title}"):
+            st.write(f"**Classification:** {x.get('significance') or 'Not stated in retrieved summary.'}")
             st.write(f"**Variation ID:** {x.get('variation_id') or '—'}")
             if x.get("url"):
-                st.markdown(f"[Open the original ClinVar record]({x['url']})")
+                st.link_button("Open original ClinVar record ↗", x["url"])
 
 
 def render_pdb(items):
-    st.subheader("3D structural evidence")
+    st.markdown("### Molecular structure")
     if not items:
-        st.info("No matching experimental PDB structures were retrieved.")
+        st.info("No matching experimental PDB structures were retrieved for this resolved protein.")
         return
-    st.metric("Experimental structures", len(items))
+    st.markdown(
+        '<div class="gpi-section"><b>Why this matters</b><br>'
+        'PDB structures provide experimental snapshots of molecular architecture. '
+        'Open a structure to explore the protein in three dimensions.</div>',
+        unsafe_allow_html=True
+    )
+    cols = st.columns(4)
+    cols[0].metric("Experimental structures", len(items))
+    methods = sorted({m for x in items for m in x.get("methods", [])})
+    cols[1].metric("Methods", len(methods))
+    cols[2].metric("Best resolution", 
+                   f"{min([x.get('resolution') for x in items if isinstance(x.get('resolution'), (int,float))]):.2f} Å"
+                   if any(isinstance(x.get('resolution'), (int,float)) for x in items) else "—")
+    cols[3].metric("PDB IDs", "Available")
     for x in items:
-        with st.expander(f"{x['pdb_id']} — {x['title']}"):
-            st.write(f"**Method:** {', '.join(x.get('methods', [])) or 'Not reported'}")
-            st.write(f"**Resolution:** {x.get('resolution')} Å" if x.get("resolution") else "**Resolution:** Not reported")
-            if x.get("deposit_date"):
-                st.write(f"**Deposited:** {x['deposit_date']}")
-            st.markdown(f"[View structure on RCSB PDB]({x['url']})")
+        pid = x.get("pdb_id", "PDB")
+        with st.expander(f"🧊 {pid}  ·  {x.get('title') or 'Experimental structure'}"):
+            a,b = st.columns(2)
+            with a:
+                st.write(f"**Method:** {', '.join(x.get('methods', [])) or 'Not reported'}")
+                st.write(f"**Resolution:** {x.get('resolution')} Å" if x.get("resolution") else "**Resolution:** Not reported")
+            with b:
+                if x.get("deposit_date"):
+                    st.write(f"**Deposited:** {x['deposit_date']}")
+                st.link_button(f"Explore {pid} in RCSB PDB ↗", x["url"])
 
 
 def render_literature(lit):
-    st.subheader("Scientific literature")
+    st.markdown("### Scientific literature")
     count = lit.get("count", 0)
     papers = lit.get("papers", [])
-    st.metric("Relevant PubMed results", count)
-    st.caption(f"Showing the top {len(papers)} retrieved papers by PubMed relevance; the database contains {count:,} matching results for this search.")
+    c1,c2 = st.columns(2)
+    c1.metric("PubMed matches", f"{count:,}")
+    c2.metric("Retrieved for review", len(papers))
+    st.caption("The number above is the matching PubMed result count; the cards below are a practical top set, not an exhaustive literature review.")
     for p in papers:
-        with st.expander(f"{p.get('year') or ''} — {p.get('title') or 'Untitled'}"):
+        with st.expander(f"{p.get('year') or 'Year'}  ·  {p.get('title') or 'Untitled'}"):
             st.write(f"**PMID:** {p.get('pmid') or '—'}")
             st.write(f"**Journal:** {p.get('journal') or '—'}")
             if p.get("authors"):
                 st.write(f"**Authors:** {p['authors']}")
             st.write(p.get("abstract") or "Abstract unavailable.")
             if p.get("url"):
-                st.markdown(f"[Open PubMed]({p['url']})")
+                st.link_button("Read on PubMed ↗", p["url"])
 
 
 def render_chem(c):
-    st.subheader("Small-molecule profile")
-    st.info("This search term resolved to a small molecule rather than a human gene/protein.")
+    st.markdown("### Small-molecule profile")
+    st.info("This term resolved to a small molecule rather than a human gene/protein.")
     cols = st.columns(4)
     cols[0].metric("PubChem CID", c.get("cid") or "—")
     cols[1].metric("Formula", c.get("formula") or "—")
     cols[2].metric("Molecular weight", c.get("weight") or "—")
     cols[3].metric("Name", c.get("title") or "—")
     st.markdown(f"**IUPAC name:** {c.get('iupac') or '—'}")
-    st.markdown(f"[Open PubChem record]({c.get('url')})")
+    if c.get("url"):
+        st.link_button("Open PubChem record ↗", c["url"])
 
 
 def main():
-    st.set_page_config(page_title=APP_TITLE, page_icon="🧬", layout="wide")
+    st.set_page_config(page_title="GeneProtein Intelligence", page_icon="🧬", layout="wide")
     styles()
 
     st.markdown("""
-    <div class="hero">
-      <div class="kicker">Biomedical AI Research Workspace</div>
-      <div class="title">🧬 GeneProtein Intelligence</div>
-      <div class="sub">Search a human gene or protein by symbol, alias or protein name.
-      GPI resolves the entity first, then retrieves independent evidence from NCBI,
-      UniProt, ClinVar, RCSB PDB and PubMed.</div>
+    <div class="gpi-hero">
+      <div class="gpi-kicker">AI-powered biomedical research workspace</div>
+      <div class="gpi-title">GeneProtein<br>Intelligence</div>
+      <div class="gpi-sub">
+        Resolve a biological entity, connect trusted biomedical evidence, explore molecular
+        structure, discover literature, and generate a source-grounded research brief.
+      </div>
+      <span class="gpi-pill">NCBI Gene</span>
+      <span class="gpi-pill">UniProt</span>
+      <span class="gpi-pill">ClinVar</span>
+      <span class="gpi-pill">RCSB PDB</span>
+      <span class="gpi-pill">PubMed</span>
     </div>
     """, unsafe_allow_html=True)
 
     with st.sidebar:
-        st.markdown("### GPI 3.0")
-        st.write("Entity resolution + evidence retrieval.")
+        st.markdown("## 🧬 GPI")
+        st.caption("Gene → Protein → Structure → Evidence → Insight")
         st.divider()
-        st.markdown("**Examples**")
-        st.code("EGFR\nBRCA1\nTP53\nHBB\nhemoglobin\ncreatinine")
-        st.caption("Research/education only. Not a diagnostic or treatment system.")
-        if st.button("Clear result", use_container_width=True):
+        st.markdown("**Try a search**")
+        examples = ["EGFR", "BRCA1", "TP53", "HBB", "hemoglobin", "creatinine"]
+        for ex in examples:
+            if st.button(ex, use_container_width=True, key=f"example_{ex}"):
+                st.session_state["gpi_query"] = ex
+                clear_current()
+                st.session_state["gpi_active_query"] = ""
+                st.rerun()
+        st.divider()
+        st.caption("Research & education only. Not a diagnostic or treatment system.")
+        if st.button("Clear current analysis", use_container_width=True):
             clear_current()
             st.session_state["gpi_active_query"] = ""
             st.rerun()
 
+    st.markdown('<div class="gpi-search">', unsafe_allow_html=True)
     query = st.text_input(
-        "Search",
+        "Search a gene, protein, or biological term",
         key="gpi_query",
-        placeholder="EGFR, BRCA1, HBB, hemoglobin, etc.",
+        placeholder="Try EGFR, BRCA1, TP53, HBB, hemoglobin…",
         max_chars=120,
         on_change=query_changed,
-        label_visibility="collapsed",
     )
+    c1,c2 = st.columns([5,1])
+    with c1:
+        st.caption("GPI resolves the entity before retrieving evidence, so results stay tied to the current search.")
+    with c2:
+        analyze = st.button("🔎 Analyze", type="primary", use_container_width=True)
+    st.markdown('</div>', unsafe_allow_html=True)
 
-    if st.button("🔎 Analyze", type="primary", use_container_width=True):
+    if analyze:
         q = query.strip()
         if not q:
-            st.error("Enter a gene or protein.")
+            st.error("Enter a gene, protein, or biological term.")
         elif len(q) < 2:
             st.error("Please enter at least 2 characters.")
         else:
@@ -887,12 +967,18 @@ def main():
 
     a = st.session_state.get("analysis")
     if not a:
-        st.markdown('<div class="card"><b>Ready.</b><br>Enter a biological entity and press Analyze. A new query always clears the previous result.</div>', unsafe_allow_html=True)
+        st.markdown("""
+        <div class="gpi-card">
+          <div class="gpi-card-title">Ready for discovery</div>
+          <div class="gpi-big">Search a gene or protein to begin.</div>
+          <div class="gpi-small">GPI will resolve the entity and assemble evidence from multiple biomedical resources.</div>
+        </div>
+        """, unsafe_allow_html=True)
         return
 
     if a.get("type") == "Not resolved":
         st.error(f"GPI could not confidently resolve “{a.get('query')}”.")
-        st.info("Try a gene symbol, protein name, or a common biological term.")
+        st.info("Try a gene symbol, protein name, alias, or common biological term.")
         return
 
     if a.get("type") == "Metabolite / Small molecule":
@@ -904,35 +990,49 @@ def main():
     cv, pdb = a.get("clinvar", []), a.get("pdb", [])
     lit = a.get("literature", {"count": 0, "papers": []})
     symbol = a.get("symbol") or a.get("query")
-    st.markdown(f"## {symbol}")
-    st.caption(f"Search: {a.get('query')}  ·  Resolved entity: {a.get('type')}")
+
+    # Identity banner
+    st.markdown(f"""
+    <div class="gpi-card">
+      <div class="gpi-card-title">Resolved biological entity</div>
+      <div class="gpi-big">{html.escape(symbol)}</div>
+      <div class="gpi-small">{html.escape(u.get("protein_name") or g.get("description") or a.get("type") or "Human biological entity")}</div>
+    </div>
+    """, unsafe_allow_html=True)
 
     cols = st.columns(5)
     cols[0].metric("Gene ID", g.get("gene_id") or "—")
     cols[1].metric("UniProt", u.get("accession") or "—")
-    cols[2].metric("ClinVar", len(cv))
-    cols[3].metric("PDB", len(pdb))
+    cols[2].metric("Variants", len(cv))
+    cols[3].metric("Structures", len(pdb))
     cols[4].metric("PubMed", f"{lit.get('count', 0):,}")
 
-    tabs = st.tabs(["Overview", "Gene", "Protein", "Diseases & Variants", "3D Structure", "Literature", "AI Research", "Sources"])
+    tabs = st.tabs(["Overview", "🧬 Gene", "🧪 Protein", "⚕️ Variants", "🧊 3D Structure", "📚 Literature", "🤖 AI Research", "🔗 Sources"])
+
     with tabs[0]:
+        st.markdown("### Research snapshot")
         x, y = st.columns(2)
         with x:
-            st.markdown('<div class="card"><b>Gene context</b><br><br>'
-                        f"Symbol: <b>{html.escape(g.get('symbol') or symbol)}</b><br>"
-                        f"Gene ID: <b>{html.escape(g.get('gene_id') or '—')}</b><br>"
-                        f"Chromosome: <b>{html.escape(g.get('chromosome') or '—')}</b><br>"
-                        f"Map location: <b>{html.escape(g.get('map_location') or '—')}</b>"
-                        "</div>", unsafe_allow_html=True)
+            st.markdown(
+                f'<div class="gpi-card"><div class="gpi-card-title">Genomic context</div>'
+                f'<div class="gpi-big">{html.escape(g.get("symbol") or symbol)}</div>'
+                f'<div class="gpi-small">NCBI Gene {html.escape(g.get("gene_id") or "—")} · '
+                f'Chromosome {html.escape(g.get("chromosome") or "—")} · '
+                f'{html.escape(g.get("map_location") or "map location unavailable")}</div></div>',
+                unsafe_allow_html=True)
         with y:
-            st.markdown('<div class="card"><b>Protein context</b><br><br>'
-                        f"Protein: <b>{html.escape(u.get('protein_name') or '—')}</b><br>"
-                        f"UniProt: <b>{html.escape(u.get('accession') or '—')}</b><br>"
-                        f"Length: <b>{u.get('length') or '—'} aa</b><br>"
-                        f"Localization: {html.escape(', '.join(u.get('localization', [])) or '—')}"
-                        "</div>", unsafe_allow_html=True)
-        st.markdown("### Evidence snapshot")
-        st.write((u.get("function") or [g.get("description") or "No concise function annotation was retrieved."])[0])
+            st.markdown(
+                f'<div class="gpi-card"><div class="gpi-card-title">Protein context</div>'
+                f'<div class="gpi-big">{html.escape(u.get("accession") or "—")}</div>'
+                f'<div class="gpi-small">{html.escape(u.get("protein_name") or "Protein record unavailable")} · '
+                f'{u.get("length") or "—"} aa · '
+                f'{html.escape(", ".join(u.get("localization", [])) or "localization unavailable")}</div></div>',
+                unsafe_allow_html=True)
+        st.markdown("### What the evidence says")
+        function_text = (u.get("function") or [g.get("description") or "No concise function annotation was retrieved."])[0]
+        st.markdown(f'<div class="gpi-section">{html.escape(function_text)}</div>', unsafe_allow_html=True)
+        if pdb:
+            st.success(f"🧊 {len(pdb)} experimental structure record(s) are available — open the 3D Structure tab.")
         if a.get("failures"):
             with st.expander("Source warnings"):
                 for f in a["failures"]:
@@ -953,7 +1053,8 @@ def main():
     with tabs[5]:
         render_literature(lit)
     with tabs[6]:
-        st.subheader("AI Research Intelligence")
+        st.markdown("### AI Research Intelligence")
+        st.caption("Gemini synthesizes only the evidence retrieved for this search. It is not a substitute for the original records.")
         if st.session_state.get("ai_error"):
             st.warning(st.session_state["ai_error"])
         elif st.session_state.get("report"):
@@ -961,18 +1062,23 @@ def main():
         else:
             st.info("No AI synthesis available.")
     with tabs[7]:
-        st.subheader("Sources")
-        if u.get("url"): st.markdown(f"- [UniProt {u.get('accession')}]({u['url']})")
-        if g.get("url"): st.markdown(f"- [NCBI Gene {g.get('gene_id')}]({g['url']})")
+        st.markdown("### Evidence sources")
+        links = []
+        if u.get("url"): links.append(("UniProt " + str(u.get("accession")), u["url"]))
+        if g.get("url"): links.append(("NCBI Gene " + str(g.get("gene_id")), g["url"]))
         for x in cv:
-            st.markdown(f"- [ClinVar {x.get('accession') or x.get('variation_id')}]({x['url']})")
+            if x.get("url"): links.append(("ClinVar " + str(x.get("accession") or x.get("variation_id")), x["url"]))
         for x in pdb:
-            st.markdown(f"- [RCSB PDB {x['pdb_id']}]({x['url']})")
+            if x.get("url"): links.append(("RCSB PDB " + str(x.get("pdb_id")), x["url"]))
         for x in lit.get("papers", []):
-            st.markdown(f"- [PubMed PMID {x.get('pmid')}]({x['url']})")
+            if x.get("url"): links.append(("PubMed PMID " + str(x.get("pmid")), x["url"]))
+        if not links:
+            st.info("No source links were returned.")
+        else:
+            for label, url in links:
+                st.link_button(label + " ↗", url)
 
-    st.divider()
-    st.caption(f"GPI {APP_VERSION} · Evidence is retrieved live from public biomedical resources. Verify important scientific claims against original records.")
+    st.markdown('<div class="gpi-footer">GPI 3.1 · Live biomedical evidence · Verify important scientific claims against original records.</div>', unsafe_allow_html=True)
 
 
 if __name__ == "__main__":
