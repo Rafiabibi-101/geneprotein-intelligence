@@ -10,7 +10,7 @@ from google import genai
 from google.genai import types
 
 APP_TITLE = "GeneProtein Intelligence"
-DEFAULT_MODEL = "gemini-2.5-flash"
+DEFAULT_MODEL = "gemini-3.6-flash"
 REQUEST_TIMEOUT = 20
 PUBMED_LIMIT = 8
 
